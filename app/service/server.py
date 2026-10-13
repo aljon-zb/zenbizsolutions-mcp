@@ -138,7 +138,14 @@ def run():
         if config['mcp_transport'] == "stdio":
             mcp_server.run(**mcp_params)
         else:
-            mcp_params.update({'host': config['mcp_host'], 'port': config['mcp_port']})
+            # FastMCP 4: HTTP transport options belong on run()/http_app(),
+            # not in the FastMCP(...) constructor.
+            mcp_params.update({
+                'host': config['mcp_host'],
+                'port': config['mcp_port'],
+                'stateless_http': True,
+                'json_response': True,
+            })
             mcp_server.run(**mcp_params)
     except Exception as e:
         _logger.exception(e)

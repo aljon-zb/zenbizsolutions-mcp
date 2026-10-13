@@ -40,8 +40,9 @@ def configure_server(config) -> dict[str, Any]:
     resource_url = (settings.auth_resource_server_url or f"{public_url}/mcp").rstrip('/')
 
     kwargs: dict[str, Any] = {
-        "stateless_http": True,
-        "json_response": True,
+        # FastMCP 4 removed HTTP transport options such as stateless_http
+        # and json_response from the FastMCP constructor. They are applied
+        # when the server is run in app.service.server.run().
         "transport_security": TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=config['allowed_hosts'] or [
