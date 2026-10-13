@@ -38,19 +38,7 @@ principals:
       - jnagy@peltierpro.com
       - joe
     permissions:
-      - "contacts.*"
-      - "crm.*"
-
-
-  aljon:
-    label: aljon
-    enabled: true
-    identifiers:
-      - aljon.garde1197@gmail.com
-      - aljon
-    permissions:
-      - "contacts.*"
-      - "crm.*"
+      - "*"
 
   peltiertech:
     label: peltiertech
@@ -58,5 +46,32 @@ principals:
     identifiers:
       - peltiertech_acctg@zenaccountants.com
       - peltiertech
+    permissions:
+      - "*"
+
+  casper:
+    label: casper
+    enabled: true
+    identifiers:
+      - casper@peltierpro.com
+      - casper
+    permissions:
+      - "*"
+
+  jordan:
+    label: jordan
+    enabled: true
+    identifiers:
+      - jordan@peltierpro.com
+      - jordan
+    permissions:
+      - "*"
+
+  spaatan:
+    label: spaatan
+    enabled: true
+    identifiers:
+      - spaatan@peltierpro.com
+      - spaatan
     permissions:
       - "*"
