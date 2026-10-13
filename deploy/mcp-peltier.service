@@ -1,0 +1,22 @@
+[Unit]
+Description=ZenBiz PeltierPro MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/mcp-peltier
+EnvironmentFile=/opt/mcp-peltier/.env
+ExecStart=/opt/mcp-peltier/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+
+# Use journald for logs:
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-peltier
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,62 @@
+# MCP tool permissions.
+#
+# IMPORTANT:
+# Each value under `identifiers` must match one of the authenticated Odoo-backed
+# OAuth identity values:
+#   - sub (formatted as odoo:<user_id>)
+#   - Odoo email
+#   - Odoo login / preferred_username
+#   - OAuth client_id
+#
+# Permission formats:
+#   "*"                                  all MCP tools
+#   "contacts.*"                         all tools from app/tools/contacts.py
+#   "crm.*"                              all CRM tools
+#   "sales.get_sales_order"              one exact module/tool
+#   "search_users"                       one exact tool name
+#
+# Unconfigured users receive only defaults.permissions.
+
+defaults:
+  permissions: []
+
+principals:
+  hanson:
+    label: Hanson
+    enabled: true
+    identifiers:
+      # Replace these examples with the real Odoo login/email value(s).
+      - hanson@peltierpro.com
+      - hanson
+    permissions:
+      - "*"
+
+  joe:
+    label: Joe
+    enabled: true
+    identifiers:
+      - jnagy@peltierpro.com
+      - joe
+    permissions:
+      - "contacts.*"
+      - "crm.*"
+
+
+  aljon:
+    label: aljon
+    enabled: true
+    identifiers:
+      - aljon.garde1197@gmail.com
+      - aljon
+    permissions:
+      - "contacts.*"
+      - "crm.*"
+
+  peltiertech:
+    label: peltiertech
+    enabled: true
+    identifiers:
+      - peltiertech_acctg@zenaccountants.com
+      - peltiertech
+    permissions:
+      - "*"
