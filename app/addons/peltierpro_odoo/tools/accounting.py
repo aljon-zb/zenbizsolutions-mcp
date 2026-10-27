@@ -10,12 +10,552 @@ def register_accounting_tools(mcp, odoo, settings, failed):
     # Accounting
     # ---------------------------------------------------------------------------
     # Reporting tools:
+    # - get_customer_invoices
+    # - get_invoice_product_sales_summary
     # - search_customer_invoices_due
     # - get_aged_receivables
     # - get_aged_payables
     # - get_customer_outstanding_balance
     # - get_vendor_outstanding_balance
     # ---------------------------------------------------------------------------
+
+    def _validate_date_range(date_from: str, date_to: str):
+        """Validate optional ISO dates and ensure the range is chronological."""
+        parsed_from = None
+        parsed_to = None
+
+        if date_from:
+            parsed_from = date.fromisoformat(date_from)
+
+        if date_to:
+            parsed_to = date.fromisoformat(date_to)
+
+        if parsed_from and parsed_to and parsed_from > parsed_to:
+            raise ValueError("date_from cannot be later than date_to.")
+
+
+    async def _read_invoice_lines(line_ids: list[int]):
+        """Read invoice lines in bounded chunks to avoid oversized RPC requests."""
+        if not line_ids:
+            return []
+
+        chunk_size = max(1, min(int(settings.max_results or 100), 200))
+        rows = []
+
+        for start in range(0, len(line_ids), chunk_size):
+            chunk = line_ids[start:start + chunk_size]
+
+            chunk_rows = await odoo.read(
+                model="account.move.line",
+                record_ids=chunk,
+                fields=[
+                    "id",
+                    "move_id",
+                    "product_id",
+                    "name",
+                    "quantity",
+                    "product_uom_id",
+                    "price_unit",
+                    "discount",
+                    "price_subtotal",
+                    "price_total",
+                    "currency_id",
+                    "display_type",
+                ],
+            )
+
+            rows.extend(chunk_rows or [])
+
+        return rows
+
+
+    async def _fetch_posted_customer_invoices(
+        date_from: str = "",
+        date_to: str = "",
+        search: str = "",
+        limit: int = 100,
+        include_lines: bool = True,
+    ):
+        """Internal helper for posted customer-invoice history/reporting tools."""
+        clean_date_from = clean_search(date_from)
+        clean_date_to = clean_search(date_to)
+        clean_query = clean_search(search)
+
+        _validate_date_range(clean_date_from, clean_date_to)
+
+        safe_limit = clamp_limit(
+            limit,
+            settings.max_results,
+        )
+
+        domain: list[Any] = [
+            ["move_type", "=", "out_invoice"],
+            ["state", "=", "posted"],
+        ]
+
+        if clean_date_from:
+            domain.append(
+                ["invoice_date", ">=", clean_date_from]
+            )
+
+        if clean_date_to:
+            domain.append(
+                ["invoice_date", "<=", clean_date_to]
+            )
+
+        if clean_query:
+            domain.extend(
+                [
+                    "|",
+                    "|",
+                    ["name", "ilike", clean_query],
+                    ["ref", "ilike", clean_query],
+                    ["partner_id", "ilike", clean_query],
+                ]
+            )
+
+        invoices = await odoo.search_read(
+            model="account.move",
+            domain=domain,
+            fields=[
+                "id",
+                "name",
+                "ref",
+                "partner_id",
+                "invoice_date",
+                "invoice_date_due",
+                "currency_id",
+                "amount_untaxed",
+                "amount_tax",
+                "amount_total",
+                "amount_residual",
+                "payment_state",
+                "invoice_payment_term_id",
+                "company_id",
+                "invoice_line_ids",
+            ],
+            limit=safe_limit,
+            order="invoice_date asc, id asc",
+        )
+
+        if not include_lines or not invoices:
+            return invoices, []
+
+        all_line_ids: list[int] = []
+
+        for invoice in invoices:
+            all_line_ids.extend(
+                invoice.get("invoice_line_ids") or []
+            )
+
+        # Preserve order while removing duplicate IDs.
+        unique_line_ids = list(dict.fromkeys(all_line_ids))
+        lines = await _read_invoice_lines(unique_line_ids)
+
+        lines_by_move: dict[int, list[dict[str, Any]]] = {}
+
+        for line in lines:
+            move = line.get("move_id")
+            move_id = (
+                move[0]
+                if isinstance(move, (list, tuple)) and move
+                else move
+            )
+
+            if not move_id:
+                continue
+
+            lines_by_move.setdefault(move_id, []).append(line)
+
+        for invoice in invoices:
+            invoice["lines"] = lines_by_move.get(
+                invoice.get("id"),
+                [],
+            )
+
+        return invoices, lines
+
+
+    @mcp.tool()
+    async def get_customer_invoices(
+        date_from: str = "",
+        date_to: str = "",
+        search: str = "",
+        include_lines: bool = True,
+        limit: int = 100,
+    ):
+        """
+        Return posted customer invoices for a date range, including paid invoices.
+
+        Use this tool for historical invoice reporting, invoice lookups, monthly or
+        quarterly invoice analysis, and requests that need invoice line details.
+
+        Unlike the outstanding/aged-receivable tools, this tool DOES NOT exclude
+        invoices that are already paid. It returns posted customer invoices based
+        on invoice_date.
+
+        Read-only.
+
+        Parameters:
+        - date_from: optional invoice start date in YYYY-MM-DD format
+        - date_to: optional invoice end date in YYYY-MM-DD format
+        - search: optional customer name, invoice number, or reference
+        - include_lines: when True, include invoice line details
+        - limit: maximum number of invoice records to return
+
+        Invoice line details include product, quantity, unit price, discount,
+        untaxed subtotal, total, and currency.
+
+        Provider: Zen Business Solutions
+        """
+
+        tool = "get_customer_invoices"
+
+        params = {
+            "date_from": clean_search(date_from),
+            "date_to": clean_search(date_to),
+            "search": clean_search(search),
+            "include_lines": include_lines,
+            "limit": limit,
+        }
+
+        try:
+            invoices, lines = await _fetch_posted_customer_invoices(
+                date_from=params["date_from"],
+                date_to=params["date_to"],
+                search=params["search"],
+                limit=limit,
+                include_lines=include_lines,
+            )
+
+            totals_by_currency: dict[int, dict[str, Any]] = {}
+
+            for invoice in invoices:
+                currency = invoice.get("currency_id") or [0, ""]
+                currency_id = currency[0] if currency else 0
+                currency_name = (
+                    currency[1]
+                    if currency and len(currency) > 1
+                    else ""
+                )
+
+                if currency_id not in totals_by_currency:
+                    totals_by_currency[currency_id] = {
+                        "currency_id": currency_id,
+                        "currency_name": currency_name,
+                        "invoice_count": 0,
+                        "amount_untaxed": 0.0,
+                        "amount_tax": 0.0,
+                        "amount_total": 0.0,
+                        "amount_residual": 0.0,
+                    }
+
+                summary = totals_by_currency[currency_id]
+                summary["invoice_count"] += 1
+                summary["amount_untaxed"] += float(
+                    invoice.get("amount_untaxed") or 0
+                )
+                summary["amount_tax"] += float(
+                    invoice.get("amount_tax") or 0
+                )
+                summary["amount_total"] += float(
+                    invoice.get("amount_total") or 0
+                )
+                summary["amount_residual"] += float(
+                    invoice.get("amount_residual") or 0
+                )
+
+            log_tool(
+                tool,
+                params,
+                len(invoices),
+            )
+
+            return branded_response(
+                {
+                    "success": True,
+                    "date_from": params["date_from"] or None,
+                    "date_to": params["date_to"] or None,
+                    "search": params["search"] or None,
+                    "includes_paid_invoices": True,
+                    "invoice_count": len(invoices),
+                    "invoice_line_count": len(lines) if include_lines else None,
+                    "totals_by_currency": list(
+                        totals_by_currency.values()
+                    ),
+                    "invoices": invoices,
+                }
+            )
+
+        except Exception as exc:
+            return failed(
+                tool,
+                exc,
+                params,
+            )
+
+
+    @mcp.tool()
+    async def get_invoice_product_sales_summary(
+        date_from: str = "",
+        date_to: str = "",
+        search: str = "",
+        limit: int = 100,
+    ):
+        """
+        Summarize products sold from POSTED CUSTOMER INVOICES for a date range.
+
+        This is the preferred tool for requests such as:
+        - "Create a summary of products sold for Q3 2026 based on invoices issued"
+        - monthly/quarterly invoiced sales by product
+        - gross sales, discounts, and net sales by invoiced product
+
+        The report uses invoice_date, not Sales Order date, and includes both paid
+        and unpaid posted customer invoices.
+
+        Calculations per invoice line:
+        - gross_sales = quantity * price_unit
+        - discount = gross_sales - price_subtotal
+        - net_sales = price_subtotal
+
+        Tax is not included in gross_sales or net_sales. Results are separated by
+        currency so values from different currencies are never mixed.
+
+        Royalty rate and royalty amount are intentionally not calculated because
+        the current connector does not define a reliable royalty-rate source.
+
+        Read-only.
+
+        Parameters:
+        - date_from: optional invoice start date in YYYY-MM-DD format
+        - date_to: optional invoice end date in YYYY-MM-DD format
+        - search: optional customer name, invoice number, or reference
+        - limit: maximum number of invoice records included in the report
+
+        Provider: Zen Business Solutions
+        """
+
+        tool = "get_invoice_product_sales_summary"
+
+        params = {
+            "date_from": clean_search(date_from),
+            "date_to": clean_search(date_to),
+            "search": clean_search(search),
+            "limit": limit,
+        }
+
+        try:
+            invoices, lines = await _fetch_posted_customer_invoices(
+                date_from=params["date_from"],
+                date_to=params["date_to"],
+                search=params["search"],
+                limit=limit,
+                include_lines=True,
+            )
+
+            invoice_by_id = {
+                invoice["id"]: invoice
+                for invoice in invoices
+            }
+
+            products: dict[tuple[int, int], dict[str, Any]] = {}
+            totals_by_currency: dict[int, dict[str, Any]] = {}
+            included_line_count = 0
+
+            for line in lines:
+                display_type = line.get("display_type")
+
+                # Exclude sections, notes, taxes/payment terms, and any other
+                # non-product/non-invoice-content lines.
+                if display_type in {
+                    "line_section",
+                    "line_note",
+                    "tax",
+                    "payment_term",
+                }:
+                    continue
+
+                product = line.get("product_id")
+
+                # This report is specifically a products-sold summary.
+                if not product:
+                    continue
+
+                move = line.get("move_id")
+                move_id = (
+                    move[0]
+                    if isinstance(move, (list, tuple)) and move
+                    else move
+                )
+
+                invoice = invoice_by_id.get(move_id)
+
+                if not invoice:
+                    continue
+
+                currency = (
+                    line.get("currency_id")
+                    or invoice.get("currency_id")
+                    or [0, ""]
+                )
+
+                currency_id = currency[0] if currency else 0
+                currency_name = (
+                    currency[1]
+                    if currency and len(currency) > 1
+                    else ""
+                )
+
+                product_id = product[0]
+                product_name = (
+                    product[1]
+                    if len(product) > 1
+                    else line.get("name") or str(product_id)
+                )
+
+                quantity = float(line.get("quantity") or 0)
+                price_unit = float(line.get("price_unit") or 0)
+                discount_rate = float(line.get("discount") or 0)
+                net_sales = float(line.get("price_subtotal") or 0)
+                gross_sales = quantity * price_unit
+                discount_amount = gross_sales - net_sales
+
+                # Avoid tiny floating-point artifacts such as 1e-13.
+                if abs(discount_amount) < 0.000001:
+                    discount_amount = 0.0
+
+                key = (currency_id, product_id)
+
+                if key not in products:
+                    products[key] = {
+                        "product_id": product_id,
+                        "product_name": product_name,
+                        "currency_id": currency_id,
+                        "currency_name": currency_name,
+                        "quantity": 0.0,
+                        "gross_sales": 0.0,
+                        "discount": 0.0,
+                        "net_sales": 0.0,
+                        "invoice_count": 0,
+                        "line_count": 0,
+                        "invoice_ids": set(),
+                        "discount_rates": set(),
+                        "royalty_rate": None,
+                        "royalty": None,
+                        "notes": "",
+                    }
+
+                item = products[key]
+                item["quantity"] += quantity
+                item["gross_sales"] += gross_sales
+                item["discount"] += discount_amount
+                item["net_sales"] += net_sales
+                item["line_count"] += 1
+                item["invoice_ids"].add(move_id)
+                item["discount_rates"].add(discount_rate)
+
+                if currency_id not in totals_by_currency:
+                    totals_by_currency[currency_id] = {
+                        "currency_id": currency_id,
+                        "currency_name": currency_name,
+                        "gross_sales": 0.0,
+                        "discount": 0.0,
+                        "net_sales": 0.0,
+                        "product_count": 0,
+                        "invoice_ids": set(),
+                    }
+
+                currency_total = totals_by_currency[currency_id]
+                currency_total["gross_sales"] += gross_sales
+                currency_total["discount"] += discount_amount
+                currency_total["net_sales"] += net_sales
+                currency_total["invoice_ids"].add(move_id)
+
+                included_line_count += 1
+
+            report_products = []
+
+            for item in products.values():
+                item["invoice_count"] = len(item["invoice_ids"])
+                item["invoice_ids"] = sorted(item["invoice_ids"])
+                item["discount_rates"] = sorted(item["discount_rates"])
+                report_products.append(item)
+
+            report_products.sort(
+                key=lambda item: (
+                    item["currency_name"],
+                    -item["net_sales"],
+                    item["product_name"],
+                )
+            )
+
+            product_counts_by_currency: dict[int, int] = {}
+
+            for item in report_products:
+                currency_id = item["currency_id"]
+                product_counts_by_currency[currency_id] = (
+                    product_counts_by_currency.get(currency_id, 0) + 1
+                )
+
+            currency_totals = []
+
+            for currency_id, item in totals_by_currency.items():
+                item["invoice_count"] = len(item["invoice_ids"])
+                item["invoice_ids"] = sorted(item["invoice_ids"])
+                item["product_count"] = product_counts_by_currency.get(
+                    currency_id,
+                    0,
+                )
+                item["royalty"] = None
+                currency_totals.append(item)
+
+            currency_totals.sort(
+                key=lambda item: item["currency_name"]
+            )
+
+            log_tool(
+                tool,
+                params,
+                len(report_products),
+            )
+
+            return branded_response(
+                {
+                    "success": True,
+                    "basis": "posted_customer_invoices",
+                    "date_field": "invoice_date",
+                    "date_from": params["date_from"] or None,
+                    "date_to": params["date_to"] or None,
+                    "search": params["search"] or None,
+                    "includes_paid_invoices": True,
+                    "invoice_count": len(invoices),
+                    "invoice_line_count": included_line_count,
+                    "product_count": len(report_products),
+                    "calculation": {
+                        "gross_sales": "quantity * price_unit",
+                        "discount": "gross_sales - price_subtotal",
+                        "net_sales": "price_subtotal",
+                        "tax_included": False,
+                    },
+                    "royalty": {
+                        "calculated": False,
+                        "reason": (
+                            "No reliable royalty-rate field/source is defined "
+                            "in the current connector."
+                        ),
+                    },
+                    "totals_by_currency": currency_totals,
+                    "products": report_products,
+                }
+            )
+
+        except Exception as exc:
+            return failed(
+                tool,
+                exc,
+                params,
+            )
+
 
     @mcp.tool()
     async def search_customer_invoices_due(
