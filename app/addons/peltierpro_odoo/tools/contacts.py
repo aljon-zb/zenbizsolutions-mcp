@@ -23,62 +23,1112 @@ def register_contacts_tools(
     """
 
     # -----------------------------------------------------------------------
+    # Contact schema discovery / safe field mapping
+    # -----------------------------------------------------------------------
+    #
+    # IMPORTANT:
+    # Odoo Contacts can contain fields added by optional modules or custom
+    # Studio/module development. We therefore inspect res.partner with
+    # fields_get() at runtime before using optional/additional fields.
+    #
+    # This keeps the MCP flexible while respecting the current Odoo user's
+    # permissions. Binary/image fields and credential-looking custom fields
+    # are intentionally not exposed through the broad contact search.
+    #
+
+    _partner_field_catalog_cache: dict[str, dict[str, Any]] | None = None
+
+    _preferred_partner_fields = [
+        # Identity / hierarchy
+        "id",
+        "name",
+        "display_name",
+        "complete_name",
+        "active",
+        "is_company",
+        "type",
+        "title",
+        "parent_id",
+        "commercial_partner_id",
+        "company_name",
+        "commercial_company_name",
+        "company_id",
+        "partner_share",
+
+        # Contact information
+        "email",
+        "email_normalized",
+        "phone",
+        "mobile",
+        "mobile_no",
+        "website",
+        "linkedin",
+        "linkedin_url",
+
+        # Address
+        "street",
+        "street2",
+        "city",
+        "state_id",
+        "zip",
+        "country_id",
+
+        # Business / classification
+        "ref",
+        "function",
+        "vat",
+        "company_registry",
+        "industry_id",
+        "category_id",
+        "user_id",
+        "team_id",
+        "customer_rank",
+        "supplier_rank",
+        "record_source",
+
+        # Locale
+        "lang",
+        "tz",
+
+        # Activities / follow-up
+        "activity_state",
+        "activity_type_id",
+        "activity_user_id",
+        "activity_date_deadline",
+        "activity_summary",
+        "activity_exception_decoration",
+        "activity_exception_icon",
+        "activity_calendar_event_id",
+
+        # Commercial / related counters when installed
+        "opportunity_count",
+        "meeting_count",
+        "sale_order_count",
+        "purchase_order_count",
+        "total_invoiced",
+        "credit",
+        "debit",
+        "credit_limit",
+
+        # Audit
+        "create_uid",
+        "create_date",
+        "write_uid",
+        "write_date",
+    ]
+
+    _fallback_partner_fields = [
+        "id",
+        "name",
+        "display_name",
+        "active",
+        "is_company",
+        "type",
+        "parent_id",
+        "email",
+        "phone",
+        "mobile_no",
+        "website",
+        "street",
+        "street2",
+        "city",
+        "state_id",
+        "zip",
+        "country_id",
+        "vat",
+        "ref",
+        "function",
+        "customer_rank",
+        "supplier_rank",
+        "record_source",
+        "create_date",
+        "write_date",
+    ]
+
+    _safe_return_field_types = {
+        "char",
+        "text",
+        "html",
+        "boolean",
+        "integer",
+        "float",
+        "monetary",
+        "date",
+        "datetime",
+        "selection",
+        "many2one",
+        "many2many",
+    }
+
+    _safe_filter_operators = {
+        "=",
+        "!=",
+        ">",
+        ">=",
+        "<",
+        "<=",
+        "ilike",
+        "not ilike",
+        "=ilike",
+        "in",
+        "not in",
+        "like",
+        "not like",
+    }
+
+    _sensitive_field_name_parts = {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "credential",
+        "api_key",
+        "apikey",
+        "private_key",
+        "access_key",
+    }
+
+    _additional_field_aliases = {
+        "job title": "function",
+        "job position": "function",
+        "position": "function",
+        "internal reference": "ref",
+        "reference": "ref",
+        "record source": "record_source",
+        "created on": "create_date",
+        "last updated on": "write_date",
+        "updated on": "write_date",
+        "created by": "create_uid",
+        "updated by": "write_uid",
+        "next activity": "activity_type_id",
+        "next activity date": "activity_date_deadline",
+        "next activity deadline": "activity_date_deadline",
+        "next activity summary": "activity_summary",
+        "activity status": "activity_state",
+        "my activity": "activity_user_id",
+        "company": "parent_id",
+        "parent company": "parent_id",
+    }
+
+    def _normalize_field_label(value: Any) -> str:
+        return " ".join(
+            str(value or "")
+            .strip()
+            .lower()
+            .replace("_", " ")
+            .split()
+        )
+
+    def _looks_sensitive_field(field_name: str) -> bool:
+        normalized = str(field_name or "").strip().lower()
+        return any(
+            part in normalized
+            for part in _sensitive_field_name_parts
+        )
+
+    async def _get_partner_field_catalog() -> dict[str, dict[str, Any]]:
+        """
+        Read res.partner field metadata once per MCP process.
+
+        If field discovery is not available for this Odoo user/database, callers
+        fall back to the known core fields instead of breaking all Contacts tools.
+        """
+        nonlocal _partner_field_catalog_cache
+
+        if _partner_field_catalog_cache is not None:
+            return _partner_field_catalog_cache
+
+        try:
+            catalog = await odoo.execute(
+                "res.partner",
+                "fields_get",
+                [],
+                attributes=[
+                    "string",
+                    "type",
+                    "relation",
+                    "readonly",
+                ],
+            )
+
+            _partner_field_catalog_cache = (
+                catalog
+                if isinstance(catalog, dict)
+                else {}
+            )
+
+        except Exception:
+            _partner_field_catalog_cache = {}
+
+        return _partner_field_catalog_cache
+
+    async def _resolve_partner_field(
+        requested_field: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Resolve either an Odoo technical field name or a user-facing field label.
+
+        Examples:
+        - "record_source" -> record_source
+        - "Record Source" -> record_source
+        - "Job Position" -> function (when Odoo reports that label)
+        """
+        requested_field = str(
+            requested_field or ""
+        ).strip()
+
+        if not requested_field:
+            raise ValueError(
+                "Additional filter/field name cannot be empty."
+            )
+
+        normalized = _normalize_field_label(
+            requested_field
+        )
+
+        alias_target = _additional_field_aliases.get(
+            normalized
+        )
+
+        catalog = await _get_partner_field_catalog()
+
+        if not catalog:
+            fallback_names = set(
+                _fallback_partner_fields
+            )
+            candidate = alias_target or requested_field
+
+            if candidate in fallback_names:
+                return candidate, {
+                    "string": candidate,
+                    "type": "char",
+                }
+
+            raise ValueError(
+                f'Cannot validate additional Odoo field "{requested_field}" '
+                "because res.partner field discovery is unavailable."
+            )
+
+        # 1. Exact technical field name.
+        if requested_field in catalog:
+            return requested_field, (
+                catalog.get(requested_field) or {}
+            )
+
+        # 2. Known human-friendly alias.
+        if alias_target and alias_target in catalog:
+            return alias_target, (
+                catalog.get(alias_target) or {}
+            )
+
+        # 3. Normalized technical field name.
+        technical_matches = [
+            field_name
+            for field_name in catalog
+            if _normalize_field_label(field_name)
+            == normalized
+        ]
+
+        if len(technical_matches) == 1:
+            field_name = technical_matches[0]
+            return field_name, (
+                catalog.get(field_name) or {}
+            )
+
+        # 4. Exact normalized Odoo display label.
+        label_matches = [
+            field_name
+            for field_name, metadata in catalog.items()
+            if _normalize_field_label(
+                (metadata or {}).get("string")
+            )
+            == normalized
+        ]
+
+        if len(label_matches) == 1:
+            field_name = label_matches[0]
+            return field_name, (
+                catalog.get(field_name) or {}
+            )
+
+        if len(label_matches) > 1:
+            raise ValueError(
+                f'Field label "{requested_field}" matches multiple Odoo fields: '
+                + ", ".join(sorted(label_matches))
+            )
+
+        raise ValueError(
+            f'Odoo contact field "{requested_field}" was not found on res.partner.'
+        )
+
+    async def _get_partner_return_fields(
+        additional_fields: list[str] | None = None,
+        include_available_fields: bool = True,
+    ) -> list[str]:
+        """
+        Return a broad but safe list of contact fields supported by this database.
+
+        Safe custom x_* fields are included automatically when
+        include_available_fields=True. Requested additional fields may use either
+        the technical name or Odoo's display label.
+        """
+        catalog = await _get_partner_field_catalog()
+
+        if not catalog:
+            fields = list(
+                dict.fromkeys(
+                    _fallback_partner_fields
+                )
+            )
+        else:
+            fields = []
+
+            for field_name in _preferred_partner_fields:
+                if field_name not in catalog:
+                    continue
+
+                metadata = (
+                    catalog.get(field_name) or {}
+                )
+                field_type = str(
+                    metadata.get("type") or ""
+                )
+
+                if field_type == "binary":
+                    continue
+
+                if _looks_sensitive_field(field_name):
+                    continue
+
+                fields.append(field_name)
+
+            if include_available_fields:
+                for field_name, metadata in catalog.items():
+                    if not str(field_name).startswith("x_"):
+                        continue
+
+                    if field_name in fields:
+                        continue
+
+                    if _looks_sensitive_field(field_name):
+                        continue
+
+                    field_type = str(
+                        (metadata or {}).get("type") or ""
+                    )
+
+                    if field_type not in _safe_return_field_types:
+                        continue
+
+                    fields.append(field_name)
+
+        for requested_field in additional_fields or []:
+            field_name, metadata = await _resolve_partner_field(
+                requested_field
+            )
+
+            if _looks_sensitive_field(field_name):
+                raise ValueError(
+                    f'Field "{requested_field}" is not exposed by the Contacts search.'
+                )
+
+            field_type = str(
+                (metadata or {}).get("type") or ""
+            )
+
+            if field_type == "binary":
+                raise ValueError(
+                    f'Binary field "{requested_field}" is not returned by Contacts search.'
+                )
+
+            if field_name not in fields:
+                fields.append(field_name)
+
+        return fields
+
+    def _text_operator(
+        exact_match: bool,
+    ) -> str:
+        # =ilike gives case-insensitive exact text matching in Odoo.
+        return "=ilike" if exact_match else "ilike"
+
+    def _or_domain(
+        conditions: list[tuple[Any, Any, Any]],
+    ) -> list[Any]:
+        """
+        Build one Odoo prefix-notation OR expression.
+
+        Example for 3 conditions:
+            ["|", "|", condition1, condition2, condition3]
+        """
+        conditions = [
+            condition
+            for condition in conditions
+            if condition
+        ]
+
+        if not conditions:
+            return []
+
+        if len(conditions) == 1:
+            return [conditions[0]]
+
+        return (
+            ["|"] * (len(conditions) - 1)
+            + conditions
+        )
+
+    async def _available_phone_fields() -> list[str]:
+        catalog = await _get_partner_field_catalog()
+
+        candidates = [
+            "phone",
+            "mobile",
+            "mobile_no",
+        ]
+
+        if not catalog:
+            return [
+                "phone",
+                "mobile_no",
+            ]
+
+        return [
+            field_name
+            for field_name in candidates
+            if field_name in catalog
+        ]
+
+    async def _build_general_search_conditions(
+        search: str,
+        exact_match: bool,
+    ) -> list[Any]:
+        """
+        Legacy/general search across the most useful contact fields.
+
+        This preserves the old search="..." integration while the new first-level
+        filters provide more precise multi-filter behavior.
+        """
+        if not search:
+            return []
+
+        operator = _text_operator(
+            exact_match
+        )
+
+        conditions: list[tuple[Any, Any, Any]] = [
+            ("name", operator, search),
+            ("email", operator, search),
+            ("ref", operator, search),
+            ("function", operator, search),
+            ("parent_id.name", operator, search),
+            ("street", operator, search),
+            ("street2", operator, search),
+            ("city", operator, search),
+            ("state_id.name", operator, search),
+            ("zip", operator, search),
+            ("country_id.name", operator, search),
+        ]
+
+        for field_name in await _available_phone_fields():
+            conditions.append(
+                (
+                    field_name,
+                    operator,
+                    search,
+                )
+            )
+
+        return _or_domain(
+            conditions
+        )
+
+    async def _build_company_filter(
+        company: str,
+        exact_match: bool,
+    ) -> list[Any]:
+        if not company:
+            return []
+
+        operator = _text_operator(
+            exact_match
+        )
+
+        catalog = await _get_partner_field_catalog()
+
+        conditions: list[tuple[Any, Any, Any]] = [
+            (
+                "parent_id.name",
+                operator,
+                company,
+            ),
+        ]
+
+        # commercial_company_name is useful on databases/modules that expose it.
+        if (
+            catalog
+            and "commercial_company_name" in catalog
+        ):
+            conditions.append(
+                (
+                    "commercial_company_name",
+                    operator,
+                    company,
+                )
+            )
+
+        return _or_domain(
+            conditions
+        )
+
+    async def _build_phone_filter(
+        phone: str,
+        exact_match: bool,
+    ) -> list[Any]:
+        if not phone:
+            return []
+
+        operator = _text_operator(
+            exact_match
+        )
+
+        conditions = [
+            (
+                field_name,
+                operator,
+                phone,
+            )
+            for field_name in await _available_phone_fields()
+        ]
+
+        return _or_domain(
+            conditions
+        )
+
+    def _build_address_filter(
+        address: str,
+        exact_match: bool,
+    ) -> list[Any]:
+        if not address:
+            return []
+
+        operator = _text_operator(
+            exact_match
+        )
+
+        return _or_domain(
+            [
+                ("street", operator, address),
+                ("street2", operator, address),
+                ("city", operator, address),
+                ("state_id.name", operator, address),
+                ("zip", operator, address),
+                ("country_id.name", operator, address),
+            ]
+        )
+
+    async def _validate_additional_filters(
+        additional_filters: list[dict[str, Any]] | None,
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
+        """
+        Validate and convert optional additional Odoo field filters.
+
+        Each item:
+        {
+            "field": "Record Source",  # technical name OR Odoo display label
+            "operator": "ilike",       # optional
+            "value": "Trade Show"
+        }
+
+        The field must exist on res.partner in this database.
+        """
+        domain: list[Any] = []
+        resolved: list[dict[str, Any]] = []
+
+        for index, raw_filter in enumerate(
+            additional_filters or [],
+            start=1,
+        ):
+            if not isinstance(raw_filter, dict):
+                raise ValueError(
+                    f"additional_filters[{index}] must be an object/dictionary."
+                )
+
+            requested_field = str(
+                raw_filter.get("field") or ""
+            ).strip()
+
+            if not requested_field:
+                raise ValueError(
+                    f'additional_filters[{index}] requires "field".'
+                )
+
+            if "value" not in raw_filter:
+                raise ValueError(
+                    f'additional_filters[{index}] requires "value".'
+                )
+
+            field_name, metadata = await _resolve_partner_field(
+                requested_field
+            )
+
+            if _looks_sensitive_field(field_name):
+                raise ValueError(
+                    f'Field "{requested_field}" is not available for flexible search.'
+                )
+
+            field_type = str(
+                (metadata or {}).get("type") or ""
+            )
+
+            default_operator = (
+                "ilike"
+                if field_type
+                in {
+                    "char",
+                    "text",
+                    "html",
+                    "selection",
+                    "many2one",
+                }
+                else "="
+            )
+
+            operator = str(
+                raw_filter.get("operator")
+                or default_operator
+            ).strip().lower()
+
+            if operator not in _safe_filter_operators:
+                raise ValueError(
+                    f'Unsupported operator "{operator}" for additional_filters[{index}]. '
+                    "Allowed operators: "
+                    + ", ".join(
+                        sorted(
+                            _safe_filter_operators
+                        )
+                    )
+                )
+
+            value = raw_filter.get("value")
+
+            if operator in {"in", "not in"}:
+                if not isinstance(
+                    value,
+                    (list, tuple),
+                ):
+                    raise ValueError(
+                        f'Operator "{operator}" requires a list value '
+                        f"for additional_filters[{index}]."
+                    )
+                value = list(value)
+
+            domain.append(
+                (
+                    field_name,
+                    operator,
+                    value,
+                )
+            )
+
+            resolved.append(
+                {
+                    "requested_field": requested_field,
+                    "field": field_name,
+                    "label": (
+                        metadata or {}
+                    ).get("string"),
+                    "type": field_type or None,
+                    "operator": operator,
+                    "value": value,
+                }
+            )
+
+        return domain, resolved
+
+    async def _search_partner_page(
+        domain: list[Any],
+        fields: list[str],
+        limit: int,
+        offset: int,
+        order: str = "name asc",
+    ) -> tuple[list[dict[str, Any]], bool, int | None]:
+        """
+        Read one result page.
+
+        Prefer OdooClient.search_read(offset=...) when supported. Older client
+        wrappers may not expose offset, so a direct execute fallback is attempted.
+        """
+        requested_limit = limit + 1
+
+        try:
+            rows = await odoo.search_read(
+                model="res.partner",
+                domain=domain,
+                fields=fields,
+                limit=requested_limit,
+                offset=offset,
+                order=order,
+            )
+
+        except TypeError as exc:
+            # Backward compatibility with older OdooClient.search_read wrappers
+            # that do not yet expose an offset keyword.
+            if "offset" not in str(exc):
+                raise
+
+            try:
+                rows = await odoo.execute(
+                    "res.partner",
+                    "search_read",
+                    [domain],
+                    fields=fields,
+                    offset=offset,
+                    limit=requested_limit,
+                    order=order,
+                )
+
+            except Exception:
+                # Last-resort compatibility fallback. This supports small offsets
+                # without requiring an unrelated OdooClient change.
+                fallback_limit = offset + requested_limit
+
+                rows_from_start = await odoo.search_read(
+                    model="res.partner",
+                    domain=domain,
+                    fields=fields,
+                    limit=fallback_limit,
+                    order=order,
+                )
+
+                rows = rows_from_start[
+                    offset:
+                    offset + requested_limit
+                ]
+
+        rows = (
+            rows
+            if isinstance(rows, list)
+            else []
+        )
+
+        page = rows[:limit]
+        has_more = len(rows) > limit
+
+        total_count: int | None = None
+
+        try:
+            count_value = await odoo.execute(
+                "res.partner",
+                "search_count",
+                [domain],
+            )
+
+            if isinstance(
+                count_value,
+                int,
+            ):
+                total_count = count_value
+
+        except Exception:
+            total_count = None
+
+        if total_count is not None:
+            has_more = (
+                offset + len(page)
+                < total_count
+            )
+
+        return (
+            page,
+            has_more,
+            total_count,
+        )
+
+
+    # -----------------------------------------------------------------------
     # Search contacts
     # -----------------------------------------------------------------------
 
     @mcp.tool()
+    async def get_contact_field_catalog():
+        """
+        Inspect the contact fields available on res.partner in this Odoo database.
+
+        Use this when the user asks for a contact field outside the core search
+        parameters (for example Record Source, LinkedIn, an activity field, or a
+        custom Studio field).
+
+        Returns readable field names, labels, and data types. This performs no
+        write and respects the connected Odoo user's permissions.
+        """
+
+        tool = "get_contact_field_catalog"
+        params: dict[str, Any] = {}
+
+        try:
+            catalog = await _get_partner_field_catalog()
+
+            if not catalog:
+                return branded_response(
+                    {
+                        "success": False,
+                        "field_discovery_available": False,
+                        "fields": [],
+                        "message": (
+                            "Odoo res.partner field discovery is not available "
+                            "for this connection."
+                        ),
+                    }
+                )
+
+            fields = [
+                {
+                    "name": field_name,
+                    "label": (
+                        metadata or {}
+                    ).get("string"),
+                    "type": (
+                        metadata or {}
+                    ).get("type"),
+                    "relation": (
+                        metadata or {}
+                    ).get("relation"),
+                    "readonly": (
+                        metadata or {}
+                    ).get("readonly"),
+                }
+                for field_name, metadata in sorted(
+                    catalog.items()
+                )
+                if (
+                    (metadata or {}).get("type")
+                    != "binary"
+                    and not _looks_sensitive_field(
+                        field_name
+                    )
+                )
+            ]
+
+            log_tool(
+                tool,
+                params,
+                success=True,
+            )
+
+            return branded_response(
+                {
+                    "success": True,
+                    "field_discovery_available": True,
+                    "count": len(fields),
+                    "fields": fields,
+                }
+            )
+
+        except Exception as exc:
+            return failed(
+                tool,
+                exc,
+                params,
+            )
+
+    @mcp.tool()
     async def search_contacts(
         search: str = "",
-        contact_type: str = "all",
+        name: str = "",
+        company: str = "",
+        job_title: str = "",
+        email: str = "",
+        phone: str = "",
+        address: str = "",
+        internal_reference: str = "",
+        active: bool | None = None,
+        is_customer: bool | None = None,
+        is_vendor: bool | None = None,
         is_company: bool | None = None,
+        contact_type: str = "all",
+        exact_match: bool = False,
+        additional_filters: list[dict[str, Any]] | None = None,
+        additional_fields: list[str] | None = None,
+        include_available_fields: bool = True,
         active_only: bool = True,
         limit: int = 20,
+        offset: int = 0,
     ):
         """
-        Search contacts in Odoo Contacts.
+        Flexible Odoo Contacts search.
 
-        Searches:
-        - Name
-        - Email
-        - Phone
-        - Internal Reference
-        - Job Title
-        - Parent Company Name
+        CORE FIRST-LEVEL FILTERS
+        ------------------------
+        Claude should map the user's natural-language request to these parameters.
+        The user does NOT need to know Odoo technical field names.
 
-        contact_type:
-        - all
-        - contact
-        - invoice
-        - delivery
-        - other
-        - private
+        name:
+            Contact/person/company name.
+
+        company:
+            Company / parent company associated with the contact.
+            For phrases such as "John from ABC Company" or
+            "contacts under XYZ Company", use this together with name or
+            is_company=False as appropriate.
+
+        job_title:
+            Odoo Job Position / function.
+
+        email:
+            Contact email.
+
+        phone:
+            Searches all supported phone fields (for example phone, mobile,
+            mobile_no).
+
+        address:
+            Searches street, street2, city, state, ZIP/postal code, and country.
+
+        internal_reference:
+            Odoo Internal Reference / ref.
+
+        active:
+            True = active contacts only.
+            False = inactive contacts only.
+            None = use the backward-compatible active_only behavior.
+
+        is_customer:
+            True = customer_rank > 0.
+            False = customer_rank = 0.
+            None = do not filter by customer classification.
+
+        is_vendor:
+            True = supplier_rank > 0.
+            False = supplier_rank = 0.
+            None = do not filter by vendor classification.
 
         is_company:
-        - None = all contacts
-        - True = company
-        - False = person
+            True = company records.
+            False = individual/person contacts.
+            None = both.
+
+        MULTIPLE FILTERS
+        ----------------
+        Core filters are combined with AND.
 
         Examples:
-        - Search for Jenny
-        - Find Peltier Pro
-        - Show company contacts
-        - Show invoice contacts
+        - "Find all active customers in California"
+          -> active=True, is_customer=True, address="California"
+
+        - "Find John from ABC Company"
+          -> name="John", company="ABC Company"
+
+        - "Show all vendors under XYZ Company"
+          -> company="XYZ Company", is_vendor=True, is_company=False
+
+        - "Find contacts with the job title Accountant"
+          -> job_title="Accountant"
+
+        PARTIAL / EXACT MATCHING
+        ------------------------
+        exact_match=False (default):
+            Uses case-insensitive partial matching for text core filters.
+
+        exact_match=True:
+            Uses case-insensitive exact text matching.
+
+        LEGACY GENERAL SEARCH
+        ---------------------
+        search preserves the previous integration. It performs a broad OR search
+        across useful fields. If search is combined with core filters, the broad
+        search expression is ANDed with those filters.
+
+        ADDITIONAL ODOO FIELDS
+        ----------------------
+        additional_filters allows filtering any supported/readable res.partner
+        field that exists in the current Odoo database.
+
+        Example:
+            additional_filters=[
+                {
+                    "field": "Record Source",
+                    "operator": "ilike",
+                    "value": "Trade Show",
+                }
+            ]
+
+        "field" may be an Odoo technical name or a user-facing field label.
+        fields_get() is used to verify the real field name/type first.
+
+        additional_fields can request extra fields in the returned contacts.
+        include_available_fields=True returns broad safe contact metadata,
+        including safe custom x_* fields supported by this database.
+
+        PAGINATION
+        ----------
+        limit:
+            Page size, bounded by the MCP configured maximum.
+
+        offset:
+            Number of matching records to skip.
+
+        The response includes has_more and next_offset.
+
+        BACKWARD COMPATIBILITY
+        ----------------------
+        active_only is preserved for existing integrations. If active is supplied,
+        active takes precedence.
         """
+
+        tool = "search_contacts"
 
         params = {
             "search": search,
-            "contact_type": contact_type,
+            "name": name,
+            "company": company,
+            "job_title": job_title,
+            "email": email,
+            "phone": phone,
+            "address": address,
+            "internal_reference": internal_reference,
+            "active": active,
+            "is_customer": is_customer,
+            "is_vendor": is_vendor,
             "is_company": is_company,
+            "contact_type": contact_type,
+            "exact_match": exact_match,
+            "additional_filters": additional_filters,
+            "additional_fields": additional_fields,
+            "include_available_fields": include_available_fields,
             "active_only": active_only,
             "limit": limit,
+            "offset": offset,
         }
 
         try:
             search = clean_search(search)
+            name = clean_search(name)
+            company = clean_search(company)
+            job_title = clean_search(job_title)
+            email = clean_search(email)
+            phone = clean_search(phone)
+            address = clean_search(address)
+            internal_reference = clean_search(
+                internal_reference
+            )
+
             limit = clamp_limit(
                 limit,
                 settings.max_results,
             )
+
+            try:
+                offset = int(offset)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "offset must be a non-negative integer."
+                )
+
+            if offset < 0:
+                raise ValueError(
+                    "offset must be a non-negative integer."
+                )
 
             allowed_contact_types = {
                 "all",
@@ -100,9 +1150,81 @@ def register_contacts_tools(
                     )
                 )
 
+            text_operator = _text_operator(
+                exact_match
+            )
+
             domain: list[Any] = []
 
-            if active_only:
+            # Backward-compatible general search.
+            domain += await _build_general_search_conditions(
+                search,
+                exact_match,
+            )
+
+            # Core first-level parameters. Each supplied core filter is ANDed
+            # with the others.
+            if name:
+                domain.append(
+                    (
+                        "name",
+                        text_operator,
+                        name,
+                    )
+                )
+
+            domain += await _build_company_filter(
+                company,
+                exact_match,
+            )
+
+            if job_title:
+                domain.append(
+                    (
+                        "function",
+                        text_operator,
+                        job_title,
+                    )
+                )
+
+            if email:
+                domain.append(
+                    (
+                        "email",
+                        text_operator,
+                        email,
+                    )
+                )
+
+            domain += await _build_phone_filter(
+                phone,
+                exact_match,
+            )
+
+            domain += _build_address_filter(
+                address,
+                exact_match,
+            )
+
+            if internal_reference:
+                domain.append(
+                    (
+                        "ref",
+                        text_operator,
+                        internal_reference,
+                    )
+                )
+
+            # Active status. Explicit active= wins over legacy active_only.
+            if active is not None:
+                domain.append(
+                    (
+                        "active",
+                        "=",
+                        bool(active),
+                    )
+                )
+            elif active_only:
                 domain.append(
                     (
                         "active",
@@ -111,12 +1233,37 @@ def register_contacts_tools(
                     )
                 )
 
-            if contact_type != "all":
+            if is_customer is True:
                 domain.append(
                     (
-                        "type",
+                        "customer_rank",
+                        ">",
+                        0,
+                    )
+                )
+            elif is_customer is False:
+                domain.append(
+                    (
+                        "customer_rank",
                         "=",
-                        contact_type,
+                        0,
+                    )
+                )
+
+            if is_vendor is True:
+                domain.append(
+                    (
+                        "supplier_rank",
+                        ">",
+                        0,
+                    )
+                )
+            elif is_vendor is False:
+                domain.append(
+                    (
+                        "supplier_rank",
+                        "=",
+                        0,
                     )
                 )
 
@@ -129,77 +1276,82 @@ def register_contacts_tools(
                     )
                 )
 
-            if search:
-                domain += [
-                    "|",
-                    "|",
-                    "|",
-                    "|",
-                    "|",
+            if contact_type != "all":
+                domain.append(
                     (
-                        "name",
-                        "ilike",
-                        search,
-                    ),
-                    (
-                        "email",
-                        "ilike",
-                        search,
-                    ),
-                    (
-                        "phone",
-                        "ilike",
-                        search,
-                    ),
-                    (
-                        "ref",
-                        "ilike",
-                        search,
-                    ),
-                    (
-                        "function",
-                        "ilike",
-                        search,
-                    ),
-                    (
-                        "parent_id.name",
-                        "ilike",
-                        search,
-                    ),
-                ]
+                        "type",
+                        "=",
+                        contact_type,
+                    )
+                )
 
-            records = await odoo.search_read(
-                model="res.partner",
-                domain=domain,
-                fields=[
-                    "id",
-                    "name",
-                    "display_name",
-                    "is_company",
-                    "type",
-                    "parent_id",
-                    "email",
-                    "phone",
-                    "website",
-                    "street",
-                    "street2",
-                    "city",
-                    "state_id",
-                    "zip",
-                    "country_id",
-                    "vat",
-                    "ref",
-                    "function",
-                    "active",
-                    "customer_rank",
-                    "supplier_rank",
-                ],
-                limit=limit,
-                order="name asc",
+            extra_domain, resolved_extra_filters = (
+                await _validate_additional_filters(
+                    additional_filters
+                )
             )
 
+            domain += extra_domain
+
+            return_fields = await _get_partner_return_fields(
+                additional_fields=additional_fields,
+                include_available_fields=include_available_fields,
+            )
+
+            records, has_more, total_count = (
+                await _search_partner_page(
+                    domain=domain,
+                    fields=return_fields,
+                    limit=limit,
+                    offset=offset,
+                    order="name asc",
+                )
+            )
+
+            next_offset = (
+                offset + len(records)
+                if has_more
+                else None
+            )
+
+            applied_filters = {
+                key: value
+                for key, value in {
+                    "search": search or None,
+                    "name": name or None,
+                    "company": company or None,
+                    "job_title": job_title or None,
+                    "email": email or None,
+                    "phone": phone or None,
+                    "address": address or None,
+                    "internal_reference": (
+                        internal_reference
+                        or None
+                    ),
+                    "active": (
+                        active
+                        if active is not None
+                        else (
+                            True
+                            if active_only
+                            else None
+                        )
+                    ),
+                    "is_customer": is_customer,
+                    "is_vendor": is_vendor,
+                    "is_company": is_company,
+                    "contact_type": (
+                        contact_type
+                        if contact_type != "all"
+                        else None
+                    ),
+                    "exact_match": exact_match,
+                }.items()
+                if value is not None
+            }
+
             log_tool(
-                "search_contacts",
+                tool,
                 params,
                 success=True,
             )
@@ -208,13 +1360,32 @@ def register_contacts_tools(
                 {
                     "success": True,
                     "count": len(records),
+                    "total_count": total_count,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": has_more,
+                    "next_offset": next_offset,
+                    "applied_filters": applied_filters,
+                    "resolved_additional_filters": (
+                        resolved_extra_filters
+                    ),
+                    "returned_fields": return_fields,
                     "contacts": records,
+                    "message": (
+                        f"Returned {len(records)} matching contact(s)"
+                        + (
+                            f" of {total_count}"
+                            if total_count is not None
+                            else ""
+                        )
+                        + "."
+                    ),
                 }
             )
 
         except Exception as exc:
             return failed(
-                "search_contacts",
+                tool,
                 exc,
                 params,
             )
@@ -256,37 +1427,10 @@ def register_contacts_tools(
                         contact_id,
                     )
                 ],
-                fields=[
-                    "id",
-                    "name",
-                    "display_name",
-                    "is_company",
-                    "type",
-                    "parent_id",
-                    "child_ids",
-                    "email",
-                    "phone",
-                    "website",
-                    "street",
-                    "street2",
-                    "city",
-                    "state_id",
-                    "zip",
-                    "country_id",
-                    "vat",
-                    "ref",
-                    "function",
-                    "lang",
-                    "tz",
-                    "active",
-                    "customer_rank",
-                    "supplier_rank",
-                    "category_id",
-                    "user_id",
-                    "company_id",
-                    "create_date",
-                    "write_date",
-                ],
+                fields=await _get_partner_return_fields(
+                    additional_fields=None,
+                    include_available_fields=True,
+                ),
                 limit=1,
             )
 
@@ -838,17 +1982,10 @@ def register_contacts_tools(
             contacts = await odoo.search_read(
                 model="res.partner",
                 domain=domain,
-                fields=[
-                    "id",
-                    "name",
-                    "display_name",
-                    "type",
-                    "email",
-                    "phone",
-                    "function",
-                    "parent_id",
-                    "active",
-                ],
+                fields=await _get_partner_return_fields(
+                    additional_fields=None,
+                    include_available_fields=True,
+                ),
                 limit=limit,
                 order="name asc",
             )
@@ -1092,26 +2229,10 @@ def register_contacts_tools(
             contacts = await odoo.search_read(
                 model="res.partner",
                 domain=contact_domain,
-                fields=[
-                    "id",
-                    "name",
-                    "display_name",
-                    "type",
-                    "is_company",
-                    "parent_id",
-                    "function",
-                    "email",
-                    "phone",
-                    "mobile_no",
-                    "street",
-                    "street2",
-                    "city",
-                    "state_id",
-                    "zip",
-                    "country_id",
-                    "ref",
-                    "active",
-                ],
+                fields=await _get_partner_return_fields(
+                    additional_fields=None,
+                    include_available_fields=True,
+                ),
                 limit=limit,
                 order="name asc",
             )
