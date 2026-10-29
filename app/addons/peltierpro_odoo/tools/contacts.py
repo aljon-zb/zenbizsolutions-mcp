@@ -42,6 +42,8 @@ def register_contacts_tools(
         - Email
         - Phone
         - Internal Reference
+        - Job Title
+        - Parent Company Name
 
         contact_type:
         - all
@@ -132,6 +134,8 @@ def register_contacts_tools(
                     "|",
                     "|",
                     "|",
+                    "|",
+                    "|",
                     (
                         "name",
                         "ilike",
@@ -149,6 +153,16 @@ def register_contacts_tools(
                     ),
                     (
                         "ref",
+                        "ilike",
+                        search,
+                    ),
+                    (
+                        "function",
+                        "ilike",
+                        search,
+                    ),
+                    (
+                        "parent_id.name",
                         "ilike",
                         search,
                     ),
@@ -229,7 +243,8 @@ def register_contacts_tools(
 
         try:
             contact_id = positive_id(
-                contact_id
+                contact_id,
+                "contact_id",
             )
 
             records = await odoo.search_read(
@@ -765,7 +780,8 @@ def register_contacts_tools(
 
         try:
             company_id = positive_id(
-                company_id
+                company_id,
+                "company_id",
             )
 
             limit = clamp_limit(
@@ -855,6 +871,281 @@ def register_contacts_tools(
         except Exception as exc:
             return failed(
                 "get_company_contacts",
+                exc,
+                params,
+            )
+
+    # -----------------------------------------------------------------------
+    # Find a person/contact by company and job role
+    # -----------------------------------------------------------------------
+
+    @mcp.tool()
+    async def find_company_contact_by_role(
+        company_name: str,
+        role: str,
+        active_only: bool = True,
+        limit: int = 20,
+    ):
+        """
+        Find people belonging to a company whose Odoo Job Position / function
+        matches a requested role.
+
+        This is the preferred tool for questions such as:
+        - Who is the CEO of 5 Minute Gourmet?
+        - Find the Sr Mechanical Engineer at 3rd Stone Design.
+        - Who is the purchasing manager at ABC Company?
+
+        Resolution flow:
+        1. Find the company res.partner record by name.
+        2. Use parent_id to retrieve people linked to that company.
+        3. Match the requested role against the function field.
+
+        The tool does not guess from email domains and does not search the web.
+        """
+
+        params = {
+            "company_name": company_name,
+            "role": role,
+            "active_only": active_only,
+            "limit": limit,
+        }
+
+        try:
+            company_name = clean_search(company_name)
+            role = clean_search(role)
+            limit = clamp_limit(
+                limit,
+                settings.max_results,
+            )
+
+            if not company_name:
+                raise ValueError(
+                    "company_name is required."
+                )
+
+            if not role:
+                raise ValueError(
+                    "role is required."
+                )
+
+            company_fields = [
+                "id",
+                "name",
+                "display_name",
+                "is_company",
+                "active",
+                "website",
+                "email",
+                "phone",
+            ]
+
+            # Prefer an exact case-insensitive company-name match first.
+            company_domain: list[Any] = [
+                (
+                    "name",
+                    "=ilike",
+                    company_name,
+                ),
+                (
+                    "is_company",
+                    "=",
+                    True,
+                ),
+            ]
+
+            if active_only:
+                company_domain.append(
+                    (
+                        "active",
+                        "=",
+                        True,
+                    )
+                )
+
+            companies = await odoo.search_read(
+                model="res.partner",
+                domain=company_domain,
+                fields=company_fields,
+                limit=10,
+                order="name asc",
+            )
+
+            # Fall back to a partial company-name match when no exact match exists.
+            if not companies:
+                company_domain = [
+                    (
+                        "name",
+                        "ilike",
+                        company_name,
+                    ),
+                    (
+                        "is_company",
+                        "=",
+                        True,
+                    ),
+                ]
+
+                if active_only:
+                    company_domain.append(
+                        (
+                            "active",
+                            "=",
+                            True,
+                        )
+                    )
+
+                companies = await odoo.search_read(
+                    model="res.partner",
+                    domain=company_domain,
+                    fields=company_fields,
+                    limit=10,
+                    order="name asc",
+                )
+
+            if not companies:
+                log_tool(
+                    "find_company_contact_by_role",
+                    params,
+                    success=True,
+                )
+                return branded_response(
+                    {
+                        "success": True,
+                        "company_found": False,
+                        "company_name": company_name,
+                        "requested_role": role,
+                        "count": 0,
+                        "contacts": [],
+                        "message": (
+                            f'No Odoo company matched "{company_name}".'
+                        ),
+                    }
+                )
+
+            # If a partial lookup produced multiple companies, do not silently guess.
+            if len(companies) > 1:
+                exact_matches = [
+                    company
+                    for company in companies
+                    if str(company.get("name") or "").strip().casefold()
+                    == company_name.casefold()
+                ]
+
+                if len(exact_matches) == 1:
+                    companies = exact_matches
+                else:
+                    log_tool(
+                        "find_company_contact_by_role",
+                        params,
+                        success=True,
+                    )
+                    return branded_response(
+                        {
+                            "success": True,
+                            "company_found": True,
+                            "ambiguous_company": True,
+                            "company_name": company_name,
+                            "requested_role": role,
+                            "company_matches": companies,
+                            "count": 0,
+                            "contacts": [],
+                            "message": (
+                                "Multiple Odoo companies matched the requested name. "
+                                "Use the exact company name before selecting a person."
+                            ),
+                        }
+                    )
+
+            company = companies[0]
+            company_id = positive_id(
+                company["id"],
+                "company_id",
+            )
+
+            contact_domain: list[Any] = [
+                (
+                    "parent_id",
+                    "=",
+                    company_id,
+                ),
+                (
+                    "is_company",
+                    "=",
+                    False,
+                ),
+                (
+                    "function",
+                    "ilike",
+                    role,
+                ),
+            ]
+
+            if active_only:
+                contact_domain.append(
+                    (
+                        "active",
+                        "=",
+                        True,
+                    )
+                )
+
+            contacts = await odoo.search_read(
+                model="res.partner",
+                domain=contact_domain,
+                fields=[
+                    "id",
+                    "name",
+                    "display_name",
+                    "type",
+                    "is_company",
+                    "parent_id",
+                    "function",
+                    "email",
+                    "phone",
+                    "mobile_no",
+                    "street",
+                    "street2",
+                    "city",
+                    "state_id",
+                    "zip",
+                    "country_id",
+                    "ref",
+                    "active",
+                ],
+                limit=limit,
+                order="name asc",
+            )
+
+            log_tool(
+                "find_company_contact_by_role",
+                params,
+                success=True,
+            )
+
+            return branded_response(
+                {
+                    "success": True,
+                    "company_found": True,
+                    "ambiguous_company": False,
+                    "company": company,
+                    "requested_role": role,
+                    "count": len(contacts),
+                    "contacts": contacts,
+                    "message": (
+                        f'Found {len(contacts)} contact(s) under "{company.get("name")}" '
+                        f'with a job title matching "{role}".'
+                        if contacts
+                        else (
+                            f'Company "{company.get("name")}" exists in Odoo, but no linked '
+                            f'person has a job title matching "{role}".'
+                        )
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            return failed(
+                "find_company_contact_by_role",
                 exc,
                 params,
             )
