@@ -2517,6 +2517,519 @@ def register_contacts_tools(
             )
 
     # -----------------------------------------------------------------------
+    # General researched-contact creation, enrichment and bulk import.
+    # The business-card workflow below is intentionally left unchanged.
+    # -----------------------------------------------------------------------
+
+    _research_contact_fields = {
+        "job_title": "function",
+        "email": "email",
+        "phone": "phone",
+        "mobile_no": "mobile_no",
+        "website": "website",
+        "record_source": "record_source",
+        "notes": "comment",
+        "street": "street",
+        "street2": "street2",
+        "city": "city",
+        "zip": "zip",
+    }
+
+    async def _research_field_map() -> dict[str, str]:
+        """Map safe writable contact attributes using this database's schema."""
+        catalog = await _get_partner_field_catalog()
+        if not catalog:
+            raise ValueError(
+                "Odoo field discovery is unavailable. Cannot safely import "
+                "researched contacts until res.partner fields_get works."
+            )
+        result: dict[str, str] = {}
+        for alias, field in _research_contact_fields.items():
+            info = catalog.get(field) or {}
+            if info and not info.get("readonly") and info.get("type") in {"char", "text", "html"}:
+                result[alias] = field
+        for candidate in ("linkedin", "linkedin_url", "x_studio_linkedin", "x_linkedin"):
+            info = catalog.get(candidate) or {}
+            if info and not info.get("readonly") and info.get("type") in {"char", "text"}:
+                result["linkedin"] = candidate
+                break
+        if "linkedin" not in result:
+            matches = [
+                field for field, info in catalog.items()
+                if "linkedin" in _normalize_field_label(info.get("string"))
+                and info.get("type") in {"char", "text"}
+                and not info.get("readonly")
+                and not _looks_sensitive_field(field)
+            ]
+            if len(matches) == 1:
+                result["linkedin"] = matches[0]
+        return result
+
+    def _research_clean(value: Any) -> str:
+        if value is None or value is False:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("Contact text fields must be strings.")
+        return value.strip()
+
+    async def _research_values(
+        raw: dict[str, Any],
+        mapping: dict[str, str],
+        source: str = "",
+    ) -> tuple[dict[str, str], list[str]]:
+        values: dict[str, str] = {}
+        unsupported: list[str] = []
+        for alias, field in _research_contact_fields.items():
+            if alias not in raw and not (alias == "record_source" and source):
+                continue
+            value = _research_clean(raw.get(alias) if raw.get(alias) is not None else (source if alias == "record_source" else ""))
+            if not value:
+                continue
+            if alias not in mapping:
+                unsupported.append(alias)
+            else:
+                values[mapping[alias]] = value
+        if "linkedin" in raw:
+            value = _research_clean(raw.get("linkedin"))
+            if value:
+                if "linkedin" not in mapping:
+                    unsupported.append("linkedin")
+                else:
+                    values[mapping["linkedin"]] = value
+        return values, unsupported
+
+    async def _research_matches(domain: list[Any], fields: list[str]) -> list[dict[str, Any]]:
+        # Two matches suffice to flag ambiguity, never silently pick the first.
+        return await odoo.search_read(
+            model="res.partner", domain=domain, fields=fields,
+            limit=2, order="id asc",
+        )
+
+    async def _research_company(name: str, company_id: Any = None) -> tuple[str, dict[str, Any] | None]:
+        fields = ["id", "name", "is_company", "active"]
+        if company_id is not None:
+            cid = positive_id(company_id, "company_id")
+            found = await _research_matches([["id", "=", cid], ["is_company", "=", True]], fields)
+            if not found:
+                return "missing_company_id", None
+            return "existing", found[0]
+        found = await _research_matches(
+            [["name", "=ilike", name], ["is_company", "=", True]], fields,
+        )
+        if len(found) > 1:
+            return "ambiguous_company", None
+        return ("existing", found[0]) if found else ("new", None)
+
+    async def _research_person(
+        name: str, company_id: int | None, email: str,
+        company_name: str = "",
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Prefer exact email; never attach an email match to the wrong employer."""
+        fields = ["id", "name", "email", "parent_id", "is_company", "active"]
+        if email:
+            found = await _research_matches(
+                [["email", "=ilike", email], ["is_company", "=", False]], fields,
+            )
+            if len(found) > 1:
+                return "ambiguous_person_email", None
+            if found:
+                person = found[0]
+                linked_id = person.get("parent_id")
+                linked_id = (linked_id[0] if isinstance(linked_id, (list, tuple))
+                             and linked_id else linked_id)
+                if linked_id not in (False, None):
+                    if company_id is not None and linked_id != company_id:
+                        return "person_company_conflict", person
+                    if company_id is None:
+                        linked_company = await odoo.read(
+                            model="res.partner", record_ids=[linked_id],
+                            fields=["id", "name", "is_company"],
+                        )
+                        if (not linked_company or
+                            _research_clean(linked_company[0].get("name")).casefold()
+                            != company_name.casefold()):
+                            return "person_company_conflict", person
+                        # The person's company exists, but the requested company
+                        # name did not resolve safely. Do not guess its ID.
+                        return "unresolved_company_match", person
+                if _research_clean(person.get("name")).casefold() != name.casefold():
+                    return "person_name_conflict", person
+                return "existing", person
+        if company_id is None:
+            return "new", None
+        found = await _research_matches(
+            [["name", "=ilike", name], ["parent_id", "=", company_id],
+             ["is_company", "=", False]], fields,
+        )
+        if len(found) > 1:
+            return "ambiguous_person_name", None
+        if found:
+            existing_email = _research_clean(found[0].get("email"))
+            if existing_email and email and existing_email.casefold() != email.casefold():
+                return "person_email_conflict", found[0]
+            return "existing", found[0]
+        return "new", None
+
+    async def _research_delta(
+        partner_id: int, candidate: dict[str, str], overwrite: bool,
+    ) -> tuple[dict[str, str], list[str]]:
+        if not candidate:
+            return {}, []
+        existing = await odoo.read(
+            model="res.partner", record_ids=[partner_id], fields=list(candidate),
+        )
+        if not existing:
+            raise ValueError(f"Could not read existing contact {partner_id}.")
+        changes: dict[str, str] = {}
+        retained: list[str] = []
+        for field, value in candidate.items():
+            old = existing[0].get(field)
+            if old not in (None, False, "") and str(old).strip():
+                if str(old).strip() == value:
+                    continue
+                if not overwrite:
+                    retained.append(field)
+                    continue
+            changes[field] = value
+        return changes, retained
+
+    async def _research_plan(
+        contact: dict[str, Any], mapping: dict[str, str],
+        source: str, overwrite: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(contact, dict):
+            raise ValueError("Each contact must be an object/dictionary.")
+        allowed_keys = set(_research_contact_fields) | {
+            "name", "company", "company_name", "company_id", "company_fields", "linkedin"
+        }
+        extra_keys = sorted(set(contact) - allowed_keys)
+        if extra_keys:
+            raise ValueError(f"Unsupported contact keys: {', '.join(extra_keys)}")
+        name = _research_clean(contact.get("name"))
+        company_name = _research_clean(contact.get("company") or contact.get("company_name"))
+        if not name:
+            raise ValueError("Each person requires a name.")
+        if not company_name and contact.get("company_id") is None:
+            raise ValueError(f"{name}: company or company_id is required.")
+        company_status, company = await _research_company(company_name, contact.get("company_id"))
+        if company_status not in ("new", "existing"):
+            raise ValueError(f"{name}: {company_status}; resolve this company before importing.")
+        if company is not None:
+            company_name = str(company["name"])
+        company_data = contact.get("company_fields") or {}
+        if not isinstance(company_data, dict):
+            raise ValueError("company_fields must be an object/dictionary.")
+        extra_company_keys = sorted(set(company_data) - set(_research_contact_fields) - {"linkedin"})
+        if extra_company_keys:
+            raise ValueError(f"Unsupported company_fields keys: {', '.join(extra_company_keys)}")
+        person_values, unsupported_person = await _research_values(contact, mapping, source)
+        company_values, unsupported_company = await _research_values(company_data, mapping)
+        # The overall source describes the person's research/import event.
+        # Do not change the provenance of a reused company automatically.
+        if company_status == "new" and source and "record_source" in mapping:
+            company_values.setdefault(mapping["record_source"], source)
+        unsupported = sorted(set(unsupported_person + unsupported_company))
+        if unsupported:
+            raise ValueError(
+                f"{name}: unsupported or non-writable Odoo fields: {', '.join(unsupported)}. "
+                "Configure the fields in Odoo or remove them from the payload."
+            )
+        cid = int(company["id"]) if company else None
+        email = person_values.get("email", "")
+        person_status, person = await _research_person(name, cid, email, company_name)
+        if person_status not in ("new", "existing"):
+            raise ValueError(f"{name}: {person_status}; manual review required.")
+        company_changes, company_retained = (
+            await _research_delta(cid, company_values, overwrite)
+            if cid is not None else (company_values, [])
+        )
+        person_changes, person_retained = (
+            await _research_delta(int(person["id"]), person_values, overwrite)
+            if person else (person_values, [])
+        )
+        parent_value = person.get("parent_id") if person else None
+        existing_parent_id = (
+            parent_value[0] if isinstance(parent_value, (list, tuple)) and parent_value
+            else parent_value
+        )
+        link_person = bool(person and existing_parent_id in (False, None))
+        return {
+            "name": name, "company_name": company_name,
+            "company_status": company_status, "company_id": cid,
+            "person_status": person_status,
+            "person_id": int(person["id"]) if person else None,
+            "link_existing_person": link_person,
+            "company_changes": company_changes, "person_changes": person_changes,
+            "company_retained_fields": company_retained,
+            "person_retained_fields": person_retained,
+        }
+
+    async def _research_apply(plan: dict[str, Any]) -> dict[str, Any]:
+        company_id = plan["company_id"]
+        company_created = company_id is None
+        if company_created:
+            company_id = await odoo.create(
+                model="res.partner",
+                values={"name": plan["company_name"], "is_company": True,
+                        **plan["company_changes"]},
+            )
+            company_id = positive_id(company_id, "created_company_id")
+        elif plan["company_changes"]:
+            written = await odoo.execute(
+                "res.partner", "write", [company_id], vals=plan["company_changes"],
+            )
+            if written is not True:
+                raise ValueError(f"Company {company_id}: Odoo did not confirm the update.")
+        person_id = plan["person_id"]
+        person_created = person_id is None
+        if person_created:
+            person_id = await odoo.create(
+                model="res.partner",
+                values={"name": plan["name"], "is_company": False,
+                        "type": "contact", "parent_id": company_id,
+                        **plan["person_changes"]},
+            )
+            person_id = positive_id(person_id, "created_contact_id")
+        elif plan["person_changes"] or plan["link_existing_person"]:
+            update_values = dict(plan["person_changes"])
+            if plan["link_existing_person"]:
+                update_values["parent_id"] = company_id
+            written = await odoo.execute(
+                "res.partner", "write", [person_id], vals=update_values,
+            )
+            if written is not True:
+                raise ValueError(f"Contact {person_id}: Odoo did not confirm the update.")
+        return {
+            "name": plan["name"], "company_name": plan["company_name"],
+            "company_id": company_id, "contact_id": person_id,
+            "company_created": company_created, "contact_created": person_created,
+            "company_updated_fields": list(plan["company_changes"]) if not company_created else [],
+            "contact_updated_fields": (
+                list(plan["person_changes"]) + (["parent_id"] if plan["link_existing_person"] else [])
+            ) if not person_created else [],
+            "company_url": _odoo_contact_url(company_id),
+            "contact_url": _odoo_contact_url(person_id),
+        }
+
+    @mcp.tool()
+    async def bulk_import_contacts(
+        contacts: list[dict[str, Any]],
+        record_source: str = "",
+        preview_only: bool = True,
+        user_confirmed: bool = False,
+        update_existing: bool = True,
+        overwrite_existing: bool = False,
+    ):
+        """Import researched speakers, prospects and company/person contacts.
+
+        This is NOT the scanned-business-card tool; scan_quality is not needed.
+        First call preview_only=True and show results to the user. Execute only
+        with their explicit approval: preview_only=False, user_confirmed=True.
+        Supports name, company/company_id, job_title, email, phone, mobile_no,
+        website, linkedin, notes, record_source, address fields, company_fields.
+        Match ambiguous people/companies conservatively; never invent details.
+        Existing populated fields are preserved by default. Import up to
+        settings.max_results per call; larger lists must be split into batches.
+        Failures are reported individually; earlier successful writes remain.
+        """
+        tool = "bulk_import_contacts"
+        params = {
+            "count": len(contacts) if isinstance(contacts, list) else None,
+            "record_source": record_source, "preview_only": preview_only,
+            "user_confirmed": user_confirmed, "update_existing": update_existing,
+            "overwrite_existing": overwrite_existing,
+        }
+        try:
+            if not isinstance(contacts, list) or not contacts:
+                raise ValueError("contacts must be a nonempty list.")
+            if len(contacts) > settings.max_results:
+                raise ValueError(f"Maximum {settings.max_results} contacts per batch.")
+            source = _research_clean(record_source)
+            if not preview_only and user_confirmed is not True:
+                return branded_response({
+                    "success": False, "requires_confirmation": True,
+                    "message": "No changes made. Preview and obtain explicit approval first.",
+                })
+            if overwrite_existing and not user_confirmed and not preview_only:
+                raise ValueError("Explicit approval required to overwrite populated fields.")
+            mapping = await _research_field_map()
+            results: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            seen_names: set[tuple[str, str]] = set()
+            seen_emails: set[str] = set()
+            preview_companies: set[str] = set()
+            for index, contact in enumerate(contacts, start=1):
+                try:
+                    # Validate and plan each request. During execution, every
+                    # iteration fetches fresh Odoo data so companies and people
+                    # created by earlier entries are reused in later entries.
+                    plan = await _research_plan(contact, mapping, source, overwrite_existing)
+                    company_key = (f"id:{plan['company_id']}" if plan["company_id"]
+                                   else plan["company_name"].strip().casefold())
+                    key = (plan["name"].strip().casefold(), company_key)
+                    if key in seen_names:
+                        raise ValueError("Duplicate person/company within this batch.")
+                    # Emails must identify only one person within a batch.
+                    email = _research_clean(contact.get("email") if isinstance(contact, dict) else "")
+                    if email and email.casefold() in seen_emails:
+                        raise ValueError("Duplicate email within this batch; manual review required.")
+                    seen_names.add(key)
+                    if email:
+                        seen_emails.add(email.casefold())
+                    if not update_existing and plan["person_status"] == "existing":
+                        plan["person_changes"] = {}
+                        plan["link_existing_person"] = False
+                    if not update_existing and plan["company_status"] == "existing":
+                        plan["company_changes"] = {}
+                    if preview_only:
+                        # A new organization appears only once in the preview's
+                        # company-create count even when it has many speakers.
+                        new_company_key = plan["company_name"].strip().casefold()
+                        plan["company_creation_planned"] = (
+                            plan["company_status"] == "new"
+                            and new_company_key not in preview_companies
+                        )
+                        if plan["company_status"] == "new":
+                            preview_companies.add(new_company_key)
+                        results.append({"index": index, "status": "preview", **plan})
+                    else:
+                        # We also recheck the person/company at this point, so
+                        # rerunning a partially successful batch is safer.
+                        fresh_plan = await _research_plan(
+                            contact, mapping, source, overwrite_existing,
+                        )
+                        if not update_existing and fresh_plan["person_status"] == "existing":
+                            fresh_plan["person_changes"] = {}
+                            fresh_plan["link_existing_person"] = False
+                        if not update_existing and fresh_plan["company_status"] == "existing":
+                            fresh_plan["company_changes"] = {}
+                        applied = await _research_apply(fresh_plan)
+                        applied["status"] = "processed"
+                        applied["index"] = index
+                        results.append(applied)
+                except Exception as exc:
+                    skipped.append({
+                        "index": index,
+                        "name": contact.get("name") if isinstance(contact, dict) else None,
+                        "reason": str(exc),
+                    })
+            summary = {
+                "requested": len(contacts), "processed": len(results),
+                "skipped": len(skipped),
+                "created_companies": (
+                    sum(bool(r.get("company_creation_planned")) for r in results)
+                    if preview_only else
+                    sum(bool(r.get("company_created")) for r in results)
+                ),
+                "created_people": (
+                    sum(r.get("person_status") == "new" for r in results)
+                    if preview_only else
+                    sum(bool(r.get("contact_created")) for r in results)
+                ),
+                "updated_companies": sum(bool(r.get(
+                    "company_changes" if preview_only else "company_updated_fields"
+                )) and (r.get("company_status") == "existing" if preview_only else True)
+                    for r in results),
+                "updated_people": sum(bool(r.get(
+                    "person_changes" if preview_only else "contact_updated_fields"
+                )) and (r.get("person_status") == "existing" if preview_only else True)
+                    for r in results),
+            }
+            log_tool(tool, params, success=not skipped)
+            return branded_response({
+                "success": not skipped, "preview_only": preview_only,
+                "requires_confirmation": preview_only,
+                "partial_success": bool(results) and bool(skipped),
+                "summary": summary, "results": results, "skipped": skipped,
+                "message": (
+                    "Preview only: no Odoo records were changed."
+                    if preview_only else
+                    "Import processed. Review per-record results and skipped entries. "
+                    "Earlier successful writes are not rolled back on later failures."
+                ),
+            })
+        except Exception as exc:
+            return failed(tool, exc, params)
+
+    @mcp.tool()
+    async def create_contacts(
+        name: str,
+        company: str,
+        job_title: str = "",
+        email: str = "",
+        linkedin: str = "",
+        notes: str = "",
+        record_source: str = "",
+        company_id: int | None = None,
+        preview_only: bool = True,
+        user_confirmed: bool = False,
+    ):
+        """Create or reuse a person and company with researched details; preview first.
+        For multiple people, use bulk_import_contacts. No scan_quality required.
+        """
+        return await bulk_import_contacts(
+            contacts=[{"name": name, "company": company, "company_id": company_id,
+                       "job_title": job_title, "email": email,
+                       "linkedin": linkedin, "notes": notes}],
+            record_source=record_source, preview_only=preview_only,
+            user_confirmed=user_confirmed,
+        )
+
+    @mcp.tool()
+    async def update_contact(
+        contact_id: int,
+        fields: dict[str, str],
+        preview_only: bool = True,
+        user_confirmed: bool = False,
+        overwrite_existing: bool = False,
+    ):
+        """Update safe fields on an existing company or person by Odoo ID.
+        Supports job_title, email, linkedin, notes, record_source and contact
+        information. Never changes name/company relation. Preview and confirm first.
+        Preserves populated fields unless overwrite_existing=True.
+        """
+        tool = "update_contact"
+        params = {"contact_id": contact_id, "field_names": (
+            list(fields) if isinstance(fields, dict) else None
+        ), "preview_only": preview_only, "user_confirmed": user_confirmed,
+                  "overwrite_existing": overwrite_existing}
+        try:
+            cid = positive_id(contact_id, "contact_id")
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError("fields must be a nonempty dictionary.")
+            if not preview_only and user_confirmed is not True:
+                return branded_response({"success": False, "requires_confirmation": True,
+                                         "message": "No changes made; user approval required."})
+            mapping = await _research_field_map()
+            unexpected = sorted(set(fields) - set(_research_contact_fields) - {"linkedin"})
+            if unexpected:
+                raise ValueError(f"Unsupported update fields: {', '.join(unexpected)}")
+            candidates, unsupported = await _research_values(fields, mapping)
+            if unsupported:
+                raise ValueError(f"Fields unavailable in Odoo: {', '.join(unsupported)}")
+            records = await odoo.read(
+                model="res.partner", record_ids=[cid], fields=["id", "name", "is_company"],
+            )
+            if not records:
+                raise ValueError(f"Contact ID {cid} not found or not accessible.")
+            changes, retained = await _research_delta(cid, candidates, overwrite_existing)
+            if not preview_only and changes:
+                written = await odoo.execute("res.partner", "write", [cid], vals=changes)
+                if written is not True:
+                    raise ValueError(f"Contact {cid}: Odoo did not confirm the update.")
+            log_tool(tool, params, success=True)
+            return branded_response({
+                "success": True, "preview_only": preview_only,
+                "contact": records[0], "contact_url": _odoo_contact_url(cid),
+                "fields_to_change" if preview_only else "updated_fields": list(changes),
+                "retained_fields": retained,
+                "message": "Preview only; no changes made." if preview_only
+                           else "Contact update processed.",
+            })
+        except Exception as exc:
+            return failed(tool, exc, params)
+
+    # -----------------------------------------------------------------------
     # Business card import helpers
     # -----------------------------------------------------------------------
 
